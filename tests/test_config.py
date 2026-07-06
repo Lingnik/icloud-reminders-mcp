@@ -58,7 +58,8 @@ def test_redacted_never_leaks_password():
     red = cfg.redacted()
     assert "app_password" not in red
     assert BASE["ICLOUD_APP_PASSWORD"] not in repr(red)
-    assert red["username"] == "me@icloud.com"
+    # Apple ID local-part is masked so logs/issues don't reveal the full email.
+    assert red["username"] == "m***@icloud.com"
 
 
 def test_timeout_validation():

@@ -7,6 +7,7 @@ allowlist enforcement, optimistic concurrency, and transient-error backoff.
 
 from __future__ import annotations
 
+import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -60,8 +61,9 @@ def _is_transient(exc: BaseException) -> bool:
         status = getattr(exc, "status", None)
         if status in _TRANSIENT_STATUS:
             return True
-        text = str(exc)
-        return any(str(code) in text for code in _TRANSIENT_STATUS)
+        # DAVError rarely carries .status; fall back to a word-boundary match on
+        # the message so an unrelated number like "1500" isn't read as a 500.
+        return bool(re.search(r"\b(?:429|500|502|503|504)\b", str(exc)))
     return False
 
 
@@ -150,10 +152,13 @@ class RemindersClient:
         return collections
 
     def _safe_name(self, cal: Any) -> str:
+        # get_display_name() avoids the DeprecationWarning that caldav 3's
+        # ``.name`` property emits on every access.
         try:
-            return str(self._retry(lambda: cal.name)) or _list_id_from_url(cal.url)
+            name = self._retry(cal.get_display_name)
         except DAVError:
-            return _list_id_from_url(cal.url)
+            name = None
+        return str(name) if name else _list_id_from_url(cal.url)
 
     # --- retry --------------------------------------------------------------
 
@@ -303,9 +308,18 @@ class RemindersClient:
         obj = self._retry(lambda: coll.calendar.save_todo(cal_obj.to_ical()))
         try:
             return self._obj_to_dict(obj, coll)
-        except Exception:  # fall back to a fresh fetch if the returned obj is thin
-            refetched, _ = self._find_todo(uid, coll.list_id)
-            return self._obj_to_dict(refetched, coll)
+        except Exception:
+            # The PUT succeeded; only the returned object was thin. Do NOT re-read
+            # via search() here — iCloud's search index is eventually consistent
+            # and may not surface the new uid yet, which would wrongly look like a
+            # "not found". Return a best-effort view built from what we just wrote.
+            return vtodo_to_dict(
+                cal_obj.walk("VTODO")[0],
+                list_id=coll.list_id,
+                list_name=coll.name,
+                list_url=str(coll.calendar.url),
+                etag=None,
+            )
 
     def complete_reminder(self, uid: str, *, list_ref: str | None = None) -> dict[str, Any]:
         return self._edit_with_retry(uid, list_ref, lambda todo: mark_completed(todo))
@@ -363,7 +377,12 @@ class RemindersClient:
     ) -> dict[str, Any]:
         _, coll = self._find_todo(uid, list_ref)
         for attempt in range(self._max_attempts):
-            obj = self._retry(lambda: coll.calendar.todo_by_uid(uid))
+            try:
+                obj = self._retry(lambda: coll.calendar.todo_by_uid(uid))
+            except NotFoundError as exc:
+                raise ReminderNotFoundError(
+                    f"Reminder {uid!r} disappeared before it could be updated."
+                ) from exc
             with obj.edit_icalendar_component() as todo:
                 mutate(todo)
             try:

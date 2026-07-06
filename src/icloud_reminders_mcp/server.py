@@ -62,7 +62,7 @@ def list_reminders(
     limit: int = 50,
     offset: int = 0,
 ) -> dict[str, Any]:
-    """List reminders, newest-due first. Defaults to incomplete only.
+    """List reminders, earliest-due first (undated last). Defaults to incomplete only.
 
     `list` accepts a list_id or display name (all lists if omitted). `due_before`
     / `due_after` are ISO-8601 dates or datetimes. Results are paginated via

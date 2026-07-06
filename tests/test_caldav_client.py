@@ -68,6 +68,9 @@ class FakeCalendar:
     def name(self) -> str:
         return self._name
 
+    def get_display_name(self):
+        return self._name
+
     def get_supported_components(self):
         return list(self._comps)
 

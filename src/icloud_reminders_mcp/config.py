@@ -25,6 +25,15 @@ def _split_allowlist(raw: str | None) -> tuple[str, ...]:
     return tuple(name.strip() for name in raw.split(",") if name.strip())
 
 
+def _mask_email(email: str) -> str:
+    """Mask the local-part so a log line (or pasted issue) doesn't reveal the
+    full Apple ID: ``taylor@example.com`` -> ``t***@example.com``."""
+    local, sep, domain = email.partition("@")
+    if not sep:
+        return "***"
+    return f"{local[:1]}***@{domain}"
+
+
 @dataclass(frozen=True)
 class Config:
     username: str
@@ -85,9 +94,10 @@ class Config:
         return any(lowered == allowed.lower() for allowed in self.list_allowlist)
 
     def redacted(self) -> dict[str, object]:
-        """A log-safe view of the config. Never includes the app password."""
+        """A log-safe view of the config. Never includes the app password, and
+        masks the Apple ID local-part."""
         return {
-            "username": self.username,
+            "username": _mask_email(self.username),
             "caldav_url": self.caldav_url,
             "allow_delete": self.allow_delete,
             "list_allowlist": list(self.list_allowlist),
