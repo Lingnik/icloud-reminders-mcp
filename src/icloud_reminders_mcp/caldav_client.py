@@ -15,7 +15,7 @@ from datetime import UTC, date, datetime
 from typing import Any
 
 from caldav import DAVClient
-from caldav.lib.error import AuthorizationError, DAVError, NotFoundError
+from caldav.lib.error import AuthorizationError, DAVError, NotFoundError, ReportError
 
 from .config import Config
 from .errors import (
@@ -205,8 +205,26 @@ class RemindersClient:
                 obj = self._retry(lambda c=coll: c.calendar.todo_by_uid(uid))
             except NotFoundError:
                 continue
+            except ReportError:
+                # iCloud rejects the UID-filtered REPORT query for VTODO with
+                # 412 Precondition Failed. Fall back to the broad search
+                # list_reminders already relies on (proven to work against
+                # iCloud) and filter by UID client-side.
+                obj = self._find_todo_via_list_search(uid, coll)
+                if obj is None:
+                    continue
             return obj, coll
         raise ReminderNotFoundError(f"No reminder with uid {uid!r} was found.")
+
+    def _find_todo_via_list_search(self, uid: str, coll: _Collection) -> Any | None:
+        todos = self._retry(lambda c=coll: c.calendar.search(todo=True, include_completed=True))
+        for obj in todos:
+            comp = obj.icalendar_component
+            if comp is None or getattr(comp, "name", None) != "VTODO":
+                continue
+            if str(comp.get("UID", "")) == uid:
+                return obj
+        return None
 
     # --- mapping ------------------------------------------------------------
 
@@ -383,6 +401,13 @@ class RemindersClient:
                 raise ReminderNotFoundError(
                     f"Reminder {uid!r} disappeared before it could be updated."
                 ) from exc
+            except ReportError:
+                # Same iCloud 412 quirk as _find_todo — fall back to list+filter.
+                obj = self._find_todo_via_list_search(uid, coll)
+                if obj is None:
+                    raise ReminderNotFoundError(
+                        f"Reminder {uid!r} disappeared before it could be updated."
+                    )
             with obj.edit_icalendar_component() as todo:
                 mutate(todo)
             try:
