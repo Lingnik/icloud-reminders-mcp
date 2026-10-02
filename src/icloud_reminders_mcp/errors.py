@@ -22,6 +22,10 @@ class ListNotFoundError(RemindersError):
     """A named reminder list was not found or is not permitted by the allowlist."""
 
 
+class InvalidUidError(RemindersError):
+    """A reminder uid argument was empty or whitespace-only."""
+
+
 class ReminderNotFoundError(RemindersError):
     """A reminder (VTODO) with the given uid was not found."""
 

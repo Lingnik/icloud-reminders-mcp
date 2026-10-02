@@ -6,7 +6,7 @@ from contextlib import contextmanager
 from datetime import date
 
 import pytest
-from caldav.lib.error import NotFoundError
+from caldav.lib.error import NotFoundError, ReportError
 from icalendar import Calendar
 
 from icloud_reminders_mcp import vtodo
@@ -15,8 +15,10 @@ from icloud_reminders_mcp.config import Config
 from icloud_reminders_mcp.errors import (
     ConflictError,
     DeleteNotAllowedError,
+    InvalidUidError,
     ListNotFoundError,
     ReminderNotFoundError,
+    UpstreamError,
 )
 
 BASE = {"ICLOUD_USERNAME": "me@icloud.com", "ICLOUD_APP_PASSWORD": "aaaa-bbbb-cccc-dddd"}
@@ -277,3 +279,128 @@ def test_delete_succeeds_when_enabled_and_confirmed():
     assert res["deleted"] is True
     with pytest.raises(ReminderNotFoundError):
         client.get_reminder(uid)
+
+
+# --- UID lookup: iCloud 412 fallback -----------------------------------------
+
+
+def report_error(status: str) -> ReportError:
+    # caldav raises ReportError(errmsg(response)), where errmsg starts with the
+    # status line; the string lands in .url because it is the first argument.
+    return ReportError(f"{status}\n\n<raw response body>")
+
+
+class ReportFailingCalendar(FakeCalendar):
+    """A calendar whose UID-filtered REPORT fails, as iCloud's does for VTODO."""
+
+    def __init__(self, *args, status="412 Precondition Failed", **kwargs):
+        super().__init__(*args, **kwargs)
+        self.status = status
+        self.todo_by_uid_calls = 0
+        self.search_calls = 0
+
+    def todo_by_uid(self, uid):
+        self.todo_by_uid_calls += 1
+        raise report_error(self.status)
+
+    def search(self, todo=True, include_completed=False):
+        self.search_calls += 1
+        return super().search(todo=todo, include_completed=include_completed)
+
+
+def test_412_falls_back_to_search_and_finds_reminder():
+    cal = ReportFailingCalendar("https://p1/cal/r/", "R")
+    uid = cal.add(completed_ical("done"))  # fallback must see completed todos too
+    cal.add(make_ical("other"))
+    client = make_client([cal])
+    got = client.get_reminder(uid)
+    assert got["uid"] == uid
+    assert got["title"] == "done"
+    assert cal.search_calls == 1
+
+
+def test_412_fallback_lets_update_proceed():
+    cal = ReportFailingCalendar("https://p1/cal/r/", "R")
+    uid = cal.add(make_ical("orig", notes="keep"))
+    client = make_client([cal])
+    res = client.update_reminder(uid, title="new")
+    assert res["title"] == "new"
+    assert res["notes"] == "keep"
+
+
+@pytest.mark.parametrize(
+    "status", ["400 Bad Request", "403 Forbidden", "500 Internal Server Error"]
+)
+def test_non_412_report_error_propagates(status):
+    cal = ReportFailingCalendar("https://p1/cal/r/", "R", status=status)
+    uid = cal.add(make_ical("t"))
+    client = make_client([cal])
+    with pytest.raises(ReportError):
+        client.get_reminder(uid)
+    assert cal.search_calls == 0
+
+
+def test_412_only_in_body_does_not_trigger_fallback():
+    cal = ReportFailingCalendar("https://p1/cal/r/", "R", status="400 Bad Request (see 412)")
+    uid = cal.add(make_ical("t"))
+    client = make_client([cal])
+    with pytest.raises(ReportError):
+        client.get_reminder(uid)
+    assert cal.search_calls == 0
+
+
+def test_412_fallback_not_found():
+    cal = ReportFailingCalendar("https://p1/cal/r/", "R")
+    cal.add(make_ical("t"))
+    client = make_client([cal])
+    with pytest.raises(ReminderNotFoundError):
+        client.get_reminder("no-such-uid")
+    assert cal.search_calls == 1
+
+
+def test_412_fallback_refuses_duplicate_uid():
+    class DupCalendar(ReportFailingCalendar):
+        def search(self, todo=True, include_completed=False):
+            objs = super().search(todo=todo, include_completed=include_completed)
+            return objs + objs
+
+    cal = DupCalendar("https://p1/cal/r/", "R")
+    uid = cal.add(make_ical("t"))
+    client = make_client([cal], REMINDERS_ALLOW_DELETE="true")
+    with pytest.raises(UpstreamError):
+        client.get_reminder(uid)
+    with pytest.raises(UpstreamError):
+        client.delete_reminder(uid, confirm=True)
+    assert uid in cal.store
+
+
+def test_edit_fallback_not_found_chains_report_error():
+    class VanishingCalendar(ReportFailingCalendar):
+        """Found by _find_todo, then gone by the edit loop's re-fetch."""
+
+        def search(self, todo=True, include_completed=False):
+            objs = super().search(todo=todo, include_completed=include_completed)
+            return objs if self.search_calls == 1 else []
+
+    cal = VanishingCalendar("https://p1/cal/r/", "R")
+    uid = cal.add(make_ical("t"))
+    client = make_client([cal])
+    with pytest.raises(ReminderNotFoundError) as info:
+        client.update_reminder(uid, title="new")
+    assert isinstance(info.value.__cause__, ReportError)
+
+
+@pytest.mark.parametrize("bad_uid", ["", "   ", "\t\n"])
+def test_empty_uid_refused_before_any_lookup(bad_uid):
+    cal = ReportFailingCalendar("https://p1/cal/r/", "R")
+    cal.add(make_ical("t"))
+    client = make_client([cal], REMINDERS_ALLOW_DELETE="true")
+    with pytest.raises(InvalidUidError):
+        client.get_reminder(bad_uid)
+    with pytest.raises(InvalidUidError):
+        client.delete_reminder(bad_uid, confirm=True)
+    with pytest.raises(InvalidUidError):
+        client.update_reminder(bad_uid, title="x")
+    assert cal.todo_by_uid_calls == 0
+    assert cal.search_calls == 0
+    assert len(cal.store) == 1
