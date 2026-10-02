@@ -22,6 +22,7 @@ from .errors import (
     ConflictError,
     DeleteNotAllowedError,
     DiscoveryError,
+    InvalidUidError,
     ListNotFoundError,
     ReminderNotFoundError,
     UpstreamError,
@@ -49,6 +50,27 @@ _TRANSIENT_STATUS = {429, 500, 502, 503, 504}
 def _list_id_from_url(url: object) -> str:
     """Derive a stable id from a collection URL: its last path segment."""
     return str(url).rstrip("/").rsplit("/", 1)[-1]
+
+
+def _is_precondition_failed(exc: BaseException) -> bool:
+    """True when a caldav error reports HTTP 412 Precondition Failed.
+
+    caldav builds REPORT errors from ``errmsg(response)``, which starts with the
+    status code, and passes that string as the first positional argument (so it
+    lands in ``.url``). Match the leading status only, so a 412 elsewhere in a
+    response body does not count.
+    """
+    if getattr(exc, "status", None) == 412:
+        return True
+    for text in (getattr(exc, "url", None), getattr(exc, "reason", None)):
+        if isinstance(text, str) and re.match(r"\s*412\b", text):
+            return True
+    return False
+
+
+def _require_uid(uid: str) -> None:
+    if not isinstance(uid, str) or not uid.strip():
+        raise InvalidUidError("A reminder uid is required; got an empty value.")
 
 
 def _is_transient(exc: BaseException) -> bool:
@@ -199,32 +221,49 @@ class RemindersClient:
         raise ListNotFoundError(f"List {ref!r} not found. Available: {names}.")
 
     def _find_todo(self, uid: str, ref: str | None) -> tuple[Any, _Collection]:
+        _require_uid(uid)
         collections = [self._resolve_list(ref)] if ref else self._load_collections()
         for coll in collections:
-            try:
-                obj = self._retry(lambda c=coll: c.calendar.todo_by_uid(uid))
-            except NotFoundError:
+            obj = self._lookup_todo(uid, coll)
+            if obj is None:
                 continue
-            except ReportError:
-                # iCloud rejects the UID-filtered REPORT query for VTODO with
-                # 412 Precondition Failed. Fall back to the broad search
-                # list_reminders already relies on (proven to work against
-                # iCloud) and filter by UID client-side.
-                obj = self._find_todo_via_list_search(uid, coll)
-                if obj is None:
-                    continue
             return obj, coll
         raise ReminderNotFoundError(f"No reminder with uid {uid!r} was found.")
 
+    def _lookup_todo(self, uid: str, coll: _Collection) -> Any | None:
+        """Fetch one todo by uid from ``coll``; None when it is not there.
+
+        iCloud rejects the UID-filtered REPORT for VTODO with 412 Precondition
+        Failed. Only on that status, fall back to the broad search that
+        list_reminders already uses and match the uid client-side. Any other
+        REPORT failure propagates.
+        """
+        try:
+            return self._retry(lambda c=coll: c.calendar.todo_by_uid(uid))
+        except NotFoundError:
+            return None
+        except ReportError as exc:
+            if not _is_precondition_failed(exc):
+                raise
+            return self._find_todo_via_list_search(uid, coll)
+
     def _find_todo_via_list_search(self, uid: str, coll: _Collection) -> Any | None:
+        _require_uid(uid)
         todos = self._retry(lambda c=coll: c.calendar.search(todo=True, include_completed=True))
+        matches = []
         for obj in todos:
             comp = obj.icalendar_component
             if comp is None or getattr(comp, "name", None) != "VTODO":
                 continue
             if str(comp.get("UID", "")) == uid:
-                return obj
-        return None
+                matches.append(obj)
+        if len(matches) > 1:
+            # Same contract as caldav's todo_by_uid: exactly one match or an error.
+            raise UpstreamError(
+                f"{len(matches)} reminders in list {coll.name!r} share uid {uid!r}; "
+                "refusing to pick one."
+            )
+        return matches[0] if matches else None
 
     # --- mapping ------------------------------------------------------------
 
@@ -401,13 +440,15 @@ class RemindersClient:
                 raise ReminderNotFoundError(
                     f"Reminder {uid!r} disappeared before it could be updated."
                 ) from exc
-            except ReportError:
-                # Same iCloud 412 quirk as _find_todo — fall back to list+filter.
+            except ReportError as exc:
+                if not _is_precondition_failed(exc):
+                    raise
+                # Same iCloud 412 quirk as _find_todo: fall back to list+filter.
                 obj = self._find_todo_via_list_search(uid, coll)
                 if obj is None:
                     raise ReminderNotFoundError(
                         f"Reminder {uid!r} disappeared before it could be updated."
-                    )
+                    ) from exc
             with obj.edit_icalendar_component() as todo:
                 mutate(todo)
             try:
